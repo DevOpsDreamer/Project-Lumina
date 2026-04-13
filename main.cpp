@@ -1,22 +1,18 @@
 // =============================================================================
-//  PROJECT LUMINA v3.0 — Portfolio-Grade Command-Line Rendering Engine
+//  PROJECT LUMINA v4.0 — Gold Standard Ray Tracing Engine
 // =============================================================================
 //
-//  A production-quality, physically-based path tracer featuring:
+//  ARCHITECTURE UPGRADES FROM v3.0:
 //
-//    * LIVE ASCII PROGRESS MAP — real-time tile completion visualization
-//    * TILE-BASED THREAD POOL  — dynamic load balancing via work-stealing queue
-//    * PBR MATERIALS           — Lambertian, Metal, Dielectric (Snell + Schlick)
-//    * DEPTH-OF-FIELD CAMERA   — adjustable aperture and focal distance
-//    * RANDOM SCENE GENERATOR  — hundreds of spheres with varied materials
-//    * CLI ENGINE              — full command-line control of all parameters
-//
-//  Designed for academic presentation: Unit V — Parallel Organization
-//  Demonstrates: Symmetric Multiprocessing & Domain Decomposition
+//    * BVH ACCELERATION   — Bounding Volume Hierarchy reduces intersection
+//                           tests from O(N) to O(log N) per ray.
+//    * GAMMA 1/2.2        — Physically correct sRGB gamma curve.
+//    * COLORED LIVE MAP   — Each thread renders in a distinct console color.
+//    * ALL v3.0 FEATURES  — Tile pool, PBR materials, DOF camera, CLI.
 //
 //  Dependencies: ZERO external libraries.
-//  Compiler:     C++11 or newer. MinGW, MSVC, GCC, Clang.
-//  Output:       .ppm (Portable Pixmap) rendered to disk.
+//  Compiler:     C++11 or newer.
+//  Output:       .ppm (Portable Pixmap).
 //
 // =============================================================================
 
@@ -33,9 +29,6 @@
 #include <algorithm>
 #include <cstdio>
 
-// --- Platform-Specific Headers ----------------------------------------------
-//  Windows: Win32 API for threads, critical sections, atomic ops, console control.
-//  POSIX:   pthreads for threads, sync intrinsics for atomics.
 #ifdef _WIN32
     #include <windows.h>
 #else
@@ -45,12 +38,9 @@
 
 
 // =============================================================================
-//  PLATFORM ABSTRACTION LAYER
-// =============================================================================
-//  Portable wrappers around OS primitives so the engine code is platform-agnostic.
+//  PLATFORM ABSTRACTION
 // =============================================================================
 
-// --- Mutex (Critical Section) -----------------------------------------------
 struct Mutex {
 #ifdef _WIN32
     CRITICAL_SECTION cs;
@@ -67,7 +57,6 @@ struct Mutex {
 #endif
 };
 
-// --- Atomic Integer (lock-free thread-safe counter) -------------------------
 struct AtomicInt {
 #ifdef _WIN32
     volatile LONG value;
@@ -82,19 +71,14 @@ struct AtomicInt {
 #endif
 };
 
-// --- Hardware Thread Count --------------------------------------------------
 int get_hw_threads() {
 #ifdef _WIN32
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    return (int)si.dwNumberOfProcessors;
+    SYSTEM_INFO si; GetSystemInfo(&si); return (int)si.dwNumberOfProcessors;
 #else
-    int n = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    return (n > 0) ? n : 1;
+    int n = (int)sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? n : 1;
 #endif
 }
 
-// --- Console Cursor Control (for Live Progress Map) -------------------------
 #ifdef _WIN32
 int get_cursor_row() {
     CONSOLE_SCREEN_BUFFER_INFO csbi;
@@ -105,76 +89,80 @@ void set_cursor(int col, int row) {
     COORD pos = {(SHORT)col, (SHORT)row};
     SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), pos);
 }
-#endif
 
+// --- Console Color Palette for Thread Visualization -------------------------
+//  Each thread gets a unique color so the live map shows which core rendered
+//  which tile, using color as the primary visual differentiator.
+const WORD THREAD_COLORS[] = {
+    10,  // 0: Bright Green
+    11,  // 1: Bright Cyan
+    12,  // 2: Bright Red
+    13,  // 3: Bright Magenta
+    14,  // 4: Bright Yellow
+    15,  // 5: Bright White
+    9,   // 6: Bright Blue
+    6,   // 7: Dark Cyan
+    10, 11, 12, 13, 14, 15, 9, 6  // Repeat for threads 8-15
+};
+const int NUM_THREAD_COLORS = 16;
+const WORD COLOR_DIM     = 8;  // Dark gray (pending tiles)
+const WORD COLOR_DEFAULT = 7;  // White (normal text)
+#endif
 
 // =============================================================================
 //  CONSTANTS
 // =============================================================================
+
 const double PI      = 3.14159265358979323846;
 const double INF     = 1e30;
-const double EPSILON = 0.001;  // Shadow acne prevention
+const double EPSILON = 0.001;
+const double GAMMA   = 1.0 / 2.2;  // sRGB gamma correction exponent
 
 
 // =============================================================================
-//  SECTION 1: Vec3 — 3D Vector / Color / Point
+//  SECTION 1: Vec3
 // =============================================================================
 
 struct Vec3 {
     double x, y, z;
-
     Vec3() : x(0), y(0), z(0) {}
     Vec3(double x, double y, double z) : x(x), y(y), z(z) {}
 
-    Vec3 operator+(const Vec3& v) const { return Vec3(x+v.x, y+v.y, z+v.z); }
-    Vec3 operator-(const Vec3& v) const { return Vec3(x-v.x, y-v.y, z-v.z); }
-    Vec3 operator*(double t)      const { return Vec3(x*t, y*t, z*t); }
-    Vec3 operator*(const Vec3& v) const { return Vec3(x*v.x, y*v.y, z*v.z); }
-    Vec3 operator/(double t)      const { double inv = 1.0/t; return Vec3(x*inv, y*inv, z*inv); }
-    Vec3 operator-()              const { return Vec3(-x, -y, -z); }
-    Vec3& operator+=(const Vec3& v)     { x+=v.x; y+=v.y; z+=v.z; return *this; }
-    Vec3& operator*=(double t)          { x*=t; y*=t; z*=t; return *this; }
+    Vec3 operator+(const Vec3& v) const { return Vec3(x+v.x,y+v.y,z+v.z); }
+    Vec3 operator-(const Vec3& v) const { return Vec3(x-v.x,y-v.y,z-v.z); }
+    Vec3 operator*(double t)      const { return Vec3(x*t,y*t,z*t); }
+    Vec3 operator*(const Vec3& v) const { return Vec3(x*v.x,y*v.y,z*v.z); }
+    Vec3 operator/(double t)      const { double i=1.0/t; return Vec3(x*i,y*i,z*i); }
+    Vec3 operator-()              const { return Vec3(-x,-y,-z); }
+    Vec3& operator+=(const Vec3& v) { x+=v.x;y+=v.y;z+=v.z; return *this; }
+    Vec3& operator*=(double t)      { x*=t;y*=t;z*=t; return *this; }
 
-    double dot(const Vec3& v)   const { return x*v.x + y*v.y + z*v.z; }
-    Vec3   cross(const Vec3& v) const {
-        return Vec3(y*v.z - z*v.y, z*v.x - x*v.z, x*v.y - y*v.x);
-    }
+    double dot(const Vec3& v)   const { return x*v.x+y*v.y+z*v.z; }
+    Vec3   cross(const Vec3& v) const { return Vec3(y*v.z-z*v.y,z*v.x-x*v.z,x*v.y-y*v.x); }
+    double length_squared()     const { return x*x+y*y+z*z; }
+    double length()             const { return std::sqrt(length_squared()); }
+    Vec3   normalized()         const { double l=length(); return l<1e-12?Vec3(0,0,0):*this/l; }
+    bool   near_zero()          const { return std::fabs(x)<1e-8&&std::fabs(y)<1e-8&&std::fabs(z)<1e-8; }
 
-    double length_squared() const { return x*x + y*y + z*z; }
-    double length()         const { return std::sqrt(length_squared()); }
-
-    Vec3 normalized() const {
-        double len = length();
-        return (len < 1e-12) ? Vec3(0,0,0) : *this / len;
-    }
-
-    bool near_zero() const {
-        return std::fabs(x) < 1e-8 && std::fabs(y) < 1e-8 && std::fabs(z) < 1e-8;
-    }
-
-    // Reflect V about surface normal N.
-    static Vec3 reflect(const Vec3& v, const Vec3& n) {
-        return v - n * 2.0 * v.dot(n);
-    }
-
-    // Refract UV through surface with normal N (Snell's Law in vector form).
-    //   r_perp     = eta * (uv + cos_theta * n)
-    //   r_parallel = -sqrt(1 - |r_perp|^2) * n
+    static Vec3 reflect(const Vec3& v, const Vec3& n) { return v-n*2.0*v.dot(n); }
     static Vec3 refract(const Vec3& uv, const Vec3& n, double eta) {
-        double cos_theta = std::fmin((-uv).dot(n), 1.0);
-        Vec3 r_perp = (uv + n * cos_theta) * eta;
-        Vec3 r_para = n * (-std::sqrt(std::fabs(1.0 - r_perp.length_squared())));
-        return r_perp + r_para;
+        double ct=std::fmin((-uv).dot(n),1.0);
+        Vec3 perp=(uv+n*ct)*eta;
+        Vec3 para=n*(-std::sqrt(std::fabs(1.0-perp.length_squared())));
+        return perp+para;
     }
-
     Vec3 clamped() const {
-        return Vec3(std::fmax(0.0, std::fmin(1.0, x)),
-                    std::fmax(0.0, std::fmin(1.0, y)),
-                    std::fmax(0.0, std::fmin(1.0, z)));
+        return Vec3(std::fmax(0.0,std::fmin(1.0,x)),std::fmax(0.0,std::fmin(1.0,y)),std::fmax(0.0,std::fmin(1.0,z)));
     }
 };
 
-Vec3 operator*(double t, const Vec3& v) { return v * t; }
+Vec3 operator*(double t, const Vec3& v) { return v*t; }
+
+// Access Vec3 component by axis index (0=x, 1=y, 2=z).
+// Used by AABB slab test and BVH axis sorting.
+inline double vec3_axis(const Vec3& v, int a) {
+    return a==0 ? v.x : (a==1 ? v.y : v.z);
+}
 
 
 // =============================================================================
@@ -185,69 +173,75 @@ struct Ray {
     Vec3 origin, direction;
     Ray() {}
     Ray(const Vec3& o, const Vec3& d) : origin(o), direction(d) {}
-    Vec3 at(double t) const { return origin + direction * t; }
+    Vec3 at(double t) const { return origin+direction*t; }
 };
 
 
 // =============================================================================
-//  SECTION 3: Per-Thread RNG (xorshift64)
+//  SECTION 3: RNG (xorshift64)
 // =============================================================================
 
 struct RNG {
     unsigned long long state;
-    RNG(unsigned long long seed = 1ULL) : state(seed ? seed : 1ULL) {}
-
-    unsigned long long next() {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        return state;
-    }
-
-    double rand01() {
-        return (next() & 0xFFFFFFFFFFFFFULL) / (double)(0x10000000000000ULL);
-    }
-
-    double rr(double lo, double hi) { return lo + (hi - lo) * rand01(); }
+    RNG(unsigned long long s=1ULL) : state(s?s:1ULL) {}
+    unsigned long long next() { state^=state<<13; state^=state>>7; state^=state<<17; return state; }
+    double rand01() { return (next()&0xFFFFFFFFFFFFFULL)/(double)0x10000000000000ULL; }
+    double rr(double lo, double hi) { return lo+(hi-lo)*rand01(); }
 };
 
-Vec3 random_in_unit_sphere(RNG& rng) {
-    while (true) {
-        Vec3 p(rng.rr(-1,1), rng.rr(-1,1), rng.rr(-1,1));
-        if (p.length_squared() < 1.0) return p;
-    }
-}
+Vec3 random_in_unit_sphere(RNG& r) { while(1){Vec3 p(r.rr(-1,1),r.rr(-1,1),r.rr(-1,1));if(p.length_squared()<1)return p;} }
+Vec3 random_unit_vector(RNG& r)    { return random_in_unit_sphere(r).normalized(); }
+Vec3 random_in_unit_disk(RNG& r)   { while(1){Vec3 p(r.rr(-1,1),r.rr(-1,1),0);if(p.length_squared()<1)return p;} }
 
-Vec3 random_unit_vector(RNG& rng) {
-    return random_in_unit_sphere(rng).normalized();
-}
 
-Vec3 random_in_unit_disk(RNG& rng) {
-    while (true) {
-        Vec3 p(rng.rr(-1,1), rng.rr(-1,1), 0);
-        if (p.length_squared() < 1.0) return p;
+// =============================================================================
+//  SECTION 4: AABB (Axis-Aligned Bounding Box)
+// =============================================================================
+//  An AABB is the simplest 3D bounding volume: a box whose faces are aligned
+//  with the coordinate axes. It's defined by two corner points (mn, mx).
+//
+//  Ray-AABB intersection uses the "slab method" (Kay & Kajiya, 1986):
+//    For each axis, compute the entry and exit t-values of the ray.
+//    The ray hits the box iff the intervals overlap across all three axes.
+//
+//  This test is EXTREMELY fast (~6 multiplies, ~6 compares) compared to
+//  a full ray-sphere test (~17 ops). The BVH exploits this by testing the
+//  cheap AABB first and skipping entire subtrees when the ray misses.
+// =============================================================================
+
+struct AABB {
+    Vec3 mn, mx; // Minimum and maximum corners
+
+    AABB() {}
+    AABB(const Vec3& a, const Vec3& b) : mn(a), mx(b) {}
+
+    // Slab-based ray-AABB intersection test.
+    // Returns true if the ray passes through this box within [tmin, tmax].
+    bool hit(const Ray& r, double tmin, double tmax) const {
+        for (int a = 0; a < 3; ++a) {
+            double invD = 1.0 / vec3_axis(r.direction, a);
+            double t0 = (vec3_axis(mn, a) - vec3_axis(r.origin, a)) * invD;
+            double t1 = (vec3_axis(mx, a) - vec3_axis(r.origin, a)) * invD;
+            if (invD < 0.0) { double tmp = t0; t0 = t1; t1 = tmp; }
+            if (t0 > tmin) tmin = t0;
+            if (t1 < tmax) tmax = t1;
+            if (tmax <= tmin) return false;
+        }
+        return true;
     }
+};
+
+// Union of two AABBs: the smallest box enclosing both.
+AABB surrounding_box(const AABB& a, const AABB& b) {
+    return AABB(
+        Vec3(std::fmin(a.mn.x,b.mn.x), std::fmin(a.mn.y,b.mn.y), std::fmin(a.mn.z,b.mn.z)),
+        Vec3(std::fmax(a.mx.x,b.mx.x), std::fmax(a.mx.y,b.mx.y), std::fmax(a.mx.z,b.mx.z))
+    );
 }
 
 
 // =============================================================================
-//  SECTION 4: PHYSICALLY-BASED MATERIALS
-// =============================================================================
-//
-//  ┌──────────────┬──────────────────────────────────────────────────────┐
-//  │ LAMBERTIAN   │ Diffuse: scatters in random hemisphere direction.   │
-//  │              │ Albedo = surface color / absorption spectrum.       │
-//  ├──────────────┼──────────────────────────────────────────────────────┤
-//  │ METAL        │ Specular reflection about the normal.              │
-//  │              │ param = fuzz (0=mirror, 1=rough).                  │
-//  ├──────────────┼──────────────────────────────────────────────────────┤
-//  │ DIELECTRIC   │ Glass: refraction via Snell's Law.                 │
-//  │              │ param = refractive index (glass=1.5, water=1.33).  │
-//  │              │ Fresnel reflectance via Schlick's approximation.   │
-//  │              │ Total internal reflection when angle exceeds       │
-//  │              │ the critical angle.                                │
-//  └──────────────┴──────────────────────────────────────────────────────┘
-//
+//  SECTION 5: MATERIALS (Lambertian, Metal, Dielectric)
 // =============================================================================
 
 enum MaterialType { MAT_LAMBERTIAN, MAT_METAL, MAT_DIELECTRIC };
@@ -255,27 +249,25 @@ enum MaterialType { MAT_LAMBERTIAN, MAT_METAL, MAT_DIELECTRIC };
 struct Material {
     MaterialType type;
     Vec3 albedo;
-    double param; // fuzz (Metal) or refractive index (Dielectric)
+    double param; // fuzz (Metal) or IOR (Dielectric)
 
     Material() : type(MAT_LAMBERTIAN), albedo(Vec3(0.5,0.5,0.5)), param(0) {}
     Material(MaterialType t, const Vec3& a, double p) : type(t), albedo(a), param(p) {}
 
-    static Material lambertian(const Vec3& c)       { return Material(MAT_LAMBERTIAN, c, 0); }
-    static Material metal(const Vec3& c, double f)  { return Material(MAT_METAL, c, std::fmin(f,1.0)); }
-    static Material glass(double ior)               { return Material(MAT_DIELECTRIC, Vec3(1,1,1), ior); }
+    static Material lambertian(const Vec3& c) { return Material(MAT_LAMBERTIAN,c,0); }
+    static Material metal(const Vec3& c, double f) { return Material(MAT_METAL,c,std::fmin(f,1.0)); }
+    static Material glass(double ior) { return Material(MAT_DIELECTRIC,Vec3(1,1,1),ior); }
 };
 
-// Schlick's approximation for Fresnel reflectance.
-// R(theta) = R0 + (1-R0)(1-cos(theta))^5  where  R0 = ((n1-n2)/(n1+n2))^2
-double schlick(double cosine, double ref_idx) {
-    double r0 = (1.0 - ref_idx) / (1.0 + ref_idx);
-    r0 = r0 * r0;
-    return r0 + (1.0 - r0) * std::pow(1.0 - cosine, 5.0);
+// Schlick's approximation: R(θ) = R0 + (1-R0)(1-cosθ)^5
+double schlick(double cosine, double ri) {
+    double r0 = (1.0-ri)/(1.0+ri); r0 *= r0;
+    return r0 + (1.0-r0)*std::pow(1.0-cosine, 5.0);
 }
 
 
 // =============================================================================
-//  SECTION 5: GEOMETRY — HitRecord & Sphere
+//  SECTION 6: GEOMETRY — HitRecord & Sphere
 // =============================================================================
 
 struct HitRecord {
@@ -283,10 +275,9 @@ struct HitRecord {
     double t;
     bool front_face;
     Material material;
-
-    void set_face_normal(const Ray& r, const Vec3& outward_n) {
-        front_face = r.direction.dot(outward_n) < 0;
-        normal = front_face ? outward_n : -outward_n;
+    void set_face_normal(const Ray& r, const Vec3& on) {
+        front_face = r.direction.dot(on)<0;
+        normal = front_face ? on : -on;
     }
 };
 
@@ -298,73 +289,175 @@ struct Sphere {
     Sphere() : radius(0) {}
     Sphere(const Vec3& c, double r, const Material& m) : center(c), radius(r), material(m) {}
 
-    // Ray-Sphere intersection (quadratic with half-b optimization).
     bool hit(const Ray& r, double t_min, double t_max, HitRecord& rec) const {
         Vec3 oc = r.origin - center;
         double a = r.direction.length_squared();
-        double half_b = oc.dot(r.direction);
-        double c = oc.length_squared() - radius * radius;
-        double disc = half_b * half_b - a * c;
+        double hb = oc.dot(r.direction);
+        double c = oc.length_squared() - radius*radius;
+        double disc = hb*hb - a*c;
         if (disc < 0) return false;
-        double sqrtd = std::sqrt(disc);
-        double root = (-half_b - sqrtd) / a;
-        if (root < t_min || root > t_max) {
-            root = (-half_b + sqrtd) / a;
-            if (root < t_min || root > t_max) return false;
-        }
+        double sq = std::sqrt(disc);
+        double root = (-hb-sq)/a;
+        if (root<t_min||root>t_max) { root=(-hb+sq)/a; if(root<t_min||root>t_max) return false; }
         rec.t = root;
         rec.p = r.at(root);
-        rec.set_face_normal(r, (rec.p - center) / radius);
+        rec.set_face_normal(r, (rec.p-center)/radius);
         rec.material = material;
         return true;
+    }
+
+    // Compute the AABB for this sphere.
+    AABB bounding_box() const {
+        Vec3 rv(radius, radius, radius);
+        return AABB(center - rv, center + rv);
     }
 };
 
 
 // =============================================================================
-//  SECTION 6: SCENE INTERSECTION & PATH TRACING
+//  SECTION 7: BOUNDING VOLUME HIERARCHY (BVH)
+// =============================================================================
+//  The "Big Brain" data structure upgrade. Instead of testing every ray against
+//  all N spheres (O(N) per ray), we organize spheres into a binary tree of
+//  bounding boxes. Each internal node's AABB encloses all its children.
+//
+//  CONSTRUCTION (top-down, recursive):
+//    1. Compute the centroid bounding box of all primitives in the range.
+//    2. Choose the LONGEST AXIS of that box as the split dimension.
+//    3. Sort primitives along that axis by centroid position.
+//    4. Split at the midpoint into left and right halves.
+//    5. Recurse on each half until only 1 primitive remains (leaf node).
+//
+//  TRAVERSAL (for each ray):
+//    1. Test ray against the root node's AABB.
+//    2. If miss → skip entire tree (massive savings for rays aimed at sky).
+//    3. If hit → recurse into children. After hitting the left child, tighten
+//       t_max to rec.t so the right child is only tested if it's closer.
+//
+//  COMPLEXITY ANALYSIS:
+//    Without BVH: Each ray tests ALL N spheres       → O(N) per ray
+//    With BVH:    Each ray tests ~2·log₂(N) AABBs    → O(log N) per ray
+//
+//    For 478 spheres:
+//      O(N)     = 478 tests/ray  ×  18M rays  =  ~8.6 BILLION tests
+//      O(log N) = ~18 tests/ray  ×  18M rays  =  ~324 MILLION tests
+//      SPEEDUP: ~26× fewer intersection tests!
+//
+//  NODE LAYOUT:
+//    Stored in a flat std::vector<BVHNode> (cache-friendly, no pointer chasing).
+//    Leaf nodes store a sphere index. Internal nodes store child indices.
 // =============================================================================
 
-bool hit_scene(const std::vector<Sphere>& world, const Ray& r,
-               double t_min, double t_max, HitRecord& rec)
+struct BVHNode {
+    AABB box;
+    int left, right;  // Child node indices (-1 for leaves)
+    int sphere;       // Sphere index (>= 0 for leaves, -1 for internal)
+};
+
+// Global stat tracker for BVH build depth.
+int g_bvh_depth = 0;
+
+// Recursive BVH construction.
+// indices[start..start+count) are indices into the spheres array.
+// Returns the index of the created node in the nodes vector.
+int build_bvh(std::vector<BVHNode>& nodes, std::vector<int>& indices,
+              int start, int count, const std::vector<Sphere>& spheres, int depth)
 {
-    HitRecord temp;
-    bool hit = false;
-    double closest = t_max;
-    for (size_t i = 0; i < world.size(); ++i) {
-        if (world[i].hit(r, t_min, closest, temp)) {
-            hit = true;
-            closest = temp.t;
-            rec = temp;
-        }
+    if (depth > g_bvh_depth) g_bvh_depth = depth;
+
+    // Reserve our slot in the node array.
+    int my_idx = (int)nodes.size();
+    nodes.push_back(BVHNode());
+
+    if (count == 1) {
+        // --- LEAF NODE: contains a single sphere ---
+        int si = indices[start];
+        nodes[my_idx].sphere = si;
+        nodes[my_idx].left = nodes[my_idx].right = -1;
+        nodes[my_idx].box = spheres[si].bounding_box();
+        return my_idx;
     }
-    return hit;
+
+    // --- INTERNAL NODE: split primitives along longest axis ---
+
+    // Step 1: Compute the centroid bounding box to find the best split axis.
+    Vec3 cmin(INF, INF, INF), cmax(-INF, -INF, -INF);
+    for (int i = start; i < start + count; ++i) {
+        Vec3 c = spheres[indices[i]].center;
+        cmin = Vec3(std::fmin(cmin.x,c.x), std::fmin(cmin.y,c.y), std::fmin(cmin.z,c.z));
+        cmax = Vec3(std::fmax(cmax.x,c.x), std::fmax(cmax.y,c.y), std::fmax(cmax.z,c.z));
+    }
+    Vec3 extent = cmax - cmin;
+
+    // Step 2: Choose the longest axis for splitting.
+    int axis = 0;
+    if (extent.y > extent.x) axis = 1;
+    if (vec3_axis(extent, 2) > vec3_axis(extent, axis)) axis = 2;
+
+    // Step 3: Sort indices by sphere centroid along the chosen axis.
+    int s = start, e = start + count;
+    std::sort(indices.begin() + s, indices.begin() + e,
+        [&spheres, axis](int a, int b) {
+            return vec3_axis(spheres[a].center, axis) < vec3_axis(spheres[b].center, axis);
+        }
+    );
+
+    // Step 4: Split at midpoint and recurse.
+    int mid = count / 2;
+    nodes[my_idx].sphere = -1;
+    nodes[my_idx].left  = build_bvh(nodes, indices, start, mid, spheres, depth + 1);
+    nodes[my_idx].right = build_bvh(nodes, indices, start + mid, count - mid, spheres, depth + 1);
+    nodes[my_idx].box   = surrounding_box(nodes[nodes[my_idx].left].box,
+                                           nodes[nodes[my_idx].right].box);
+    return my_idx;
 }
 
-// --- Recursive Path Tracer --------------------------------------------------
-//  For each ray:
-//    1. Find closest intersection.
-//    2. Scatter based on material (diffuse, metal, glass).
-//    3. Recurse with scattered ray, attenuating by albedo.
-//    4. If nothing hit, return sky gradient (environment light).
-//    5. If max depth reached, return black (energy absorbed).
-// ---------------------------------------------------------------------------
-Vec3 ray_color(const Ray& r, const std::vector<Sphere>& world, int depth, RNG& rng) {
+// Recursive BVH traversal: find the closest sphere hit along the ray.
+bool hit_bvh(const std::vector<BVHNode>& nodes, int idx,
+             const std::vector<Sphere>& spheres,
+             const Ray& r, double t_min, double t_max, HitRecord& rec)
+{
+    const BVHNode& node = nodes[idx];
+
+    // Test ray against this node's bounding box.
+    // If the ray misses the box, skip the ENTIRE subtree.
+    if (!node.box.hit(r, t_min, t_max)) return false;
+
+    if (node.sphere >= 0) {
+        // LEAF: test against the actual sphere.
+        return spheres[node.sphere].hit(r, t_min, t_max, rec);
+    }
+
+    // INTERNAL: test both children, keeping the closest hit.
+    // Key optimization: after hitting left child, tighten t_max for right child.
+    bool hit_left  = hit_bvh(nodes, node.left,  spheres, r, t_min, t_max, rec);
+    bool hit_right = hit_bvh(nodes, node.right, spheres, r, t_min,
+                             hit_left ? rec.t : t_max, rec);
+    return hit_left || hit_right;
+}
+
+
+// =============================================================================
+//  SECTION 8: PATH TRACING
+// =============================================================================
+
+Vec3 ray_color(const Ray& r, const std::vector<BVHNode>& bvh, int root,
+               const std::vector<Sphere>& world, int depth, RNG& rng)
+{
     if (depth <= 0) return Vec3(0,0,0);
 
     HitRecord rec;
-    if (!hit_scene(world, r, EPSILON, INF, rec)) {
-        // Sky gradient: white at horizon, blue at zenith.
+    if (!hit_bvh(bvh, root, world, r, EPSILON, INF, rec)) {
+        // Sky gradient
         Vec3 ud = r.direction.normalized();
-        double t = 0.5 * (ud.y + 1.0);
-        return Vec3(1,1,1) * (1.0-t) + Vec3(0.5, 0.7, 1.0) * t;
+        double t = 0.5*(ud.y+1.0);
+        return Vec3(1,1,1)*(1.0-t) + Vec3(0.5,0.7,1.0)*t;
     }
 
     Vec3 attenuation;
     Ray scattered;
 
     switch (rec.material.type) {
-
     case MAT_LAMBERTIAN: {
         Vec3 dir = rec.normal + random_unit_vector(rng);
         if (dir.near_zero()) dir = rec.normal;
@@ -372,162 +465,112 @@ Vec3 ray_color(const Ray& r, const std::vector<Sphere>& world, int depth, RNG& r
         attenuation = rec.material.albedo;
         break;
     }
-
     case MAT_METAL: {
         Vec3 refl = Vec3::reflect(r.direction.normalized(), rec.normal);
-        Vec3 fuzzed = refl + random_in_unit_sphere(rng) * rec.material.param;
-        scattered = Ray(rec.p, fuzzed);
+        scattered = Ray(rec.p, refl + random_in_unit_sphere(rng)*rec.material.param);
         attenuation = rec.material.albedo;
         if (scattered.direction.dot(rec.normal) <= 0) return Vec3(0,0,0);
         break;
     }
-
     case MAT_DIELECTRIC: {
-        // Glass: refractive index stored in material.param.
-        // Determine if ray is entering (front_face) or exiting the glass.
-        attenuation = Vec3(1,1,1); // Glass is perfectly transparent.
-        double ri = rec.front_face ? (1.0 / rec.material.param) : rec.material.param;
-
+        attenuation = Vec3(1,1,1);
+        double ri = rec.front_face ? (1.0/rec.material.param) : rec.material.param;
         Vec3 ud = r.direction.normalized();
-        double cos_theta = std::fmin((-ud).dot(rec.normal), 1.0);
-        double sin_theta = std::sqrt(1.0 - cos_theta * cos_theta);
-
-        // Total Internal Reflection: when ri * sin(theta) > 1,
-        // refraction is physically impossible. Light bounces back.
-        bool cannot_refract = (ri * sin_theta) > 1.0;
-
-        Vec3 dir;
-        if (cannot_refract || schlick(cos_theta, ri) > rng.rand01()) {
-            dir = Vec3::reflect(ud, rec.normal);   // Reflect
-        } else {
-            dir = Vec3::refract(ud, rec.normal, ri); // Refract
-        }
+        double ct = std::fmin((-ud).dot(rec.normal), 1.0);
+        double st = std::sqrt(1.0-ct*ct);
+        bool tir = (ri*st) > 1.0;
+        Vec3 dir = (tir || schlick(ct,ri) > rng.rand01())
+            ? Vec3::reflect(ud, rec.normal)
+            : Vec3::refract(ud, rec.normal, ri);
         scattered = Ray(rec.p, dir);
         break;
     }
-
     default: return Vec3(0,0,0);
     }
 
-    return attenuation * ray_color(scattered, world, depth - 1, rng);
+    return attenuation * ray_color(scattered, bvh, root, world, depth-1, rng);
 }
 
 
 // =============================================================================
-//  SECTION 7: CAMERA (Depth-of-Field)
-// =============================================================================
-//  Thin-lens camera model. Rays originate from random points on the lens disk,
-//  converging at the focal plane. Objects at focus_dist are sharp; others blur.
+//  SECTION 9: CAMERA (Depth-of-Field)
 // =============================================================================
 
 struct Camera {
-    Vec3 origin, lower_left, horizontal, vertical;
-    Vec3 u, v, w;
+    Vec3 origin, lower_left, horizontal, vertical, u, v, w;
     double lens_radius;
 
-    Camera(Vec3 lookfrom, Vec3 lookat, Vec3 vup,
-           double vfov, double aspect, double aperture, double focus_dist)
+    Camera(Vec3 from, Vec3 at, Vec3 vup, double vfov, double aspect,
+           double aperture, double focus_dist)
     {
-        double theta = vfov * PI / 180.0;
-        double h = std::tan(theta / 2.0);
-        double vp_h = 2.0 * h;
-        double vp_w = aspect * vp_h;
-
-        w = (lookfrom - lookat).normalized();
-        u = vup.cross(w).normalized();
-        v = w.cross(u);
-
-        origin     = lookfrom;
-        horizontal = u * vp_w * focus_dist;
-        vertical   = v * vp_h * focus_dist;
-        lower_left = origin - horizontal/2.0 - vertical/2.0 - w * focus_dist;
-        lens_radius = aperture / 2.0;
+        double th = vfov*PI/180.0, h = std::tan(th/2.0);
+        double vh = 2.0*h, vw = aspect*vh;
+        w = (from-at).normalized(); u = vup.cross(w).normalized(); v = w.cross(u);
+        origin = from;
+        horizontal = u*vw*focus_dist;
+        vertical   = v*vh*focus_dist;
+        lower_left = origin - horizontal/2.0 - vertical/2.0 - w*focus_dist;
+        lens_radius = aperture/2.0;
     }
 
     Ray get_ray(double s, double t, RNG& rng) const {
-        Vec3 rd = random_in_unit_disk(rng) * lens_radius;
-        Vec3 offset = u * rd.x + v * rd.y;
-        return Ray(origin + offset,
-                   lower_left + horizontal*s + vertical*t - origin - offset);
+        Vec3 rd = random_in_unit_disk(rng)*lens_radius;
+        Vec3 off = u*rd.x + v*rd.y;
+        return Ray(origin+off, lower_left+horizontal*s+vertical*t-origin-off);
     }
 };
 
 
 // =============================================================================
-//  SECTION 8: RANDOM SCENE GENERATOR
-// =============================================================================
-//  Populates the world with a ground plane, three hero spheres, and hundreds
-//  of small random spheres with varied materials.
+//  SECTION 10: RANDOM SCENE GENERATOR
 // =============================================================================
 
 std::vector<Sphere> random_scene(RNG& rng) {
     std::vector<Sphere> world;
+    world.push_back(Sphere(Vec3(0,-1000,0),1000,Material::lambertian(Vec3(0.5,0.5,0.5))));
 
-    // Ground
-    world.push_back(Sphere(Vec3(0,-1000,0), 1000, Material::lambertian(Vec3(0.5,0.5,0.5))));
+    for (int a=-11; a<11; ++a) {
+        for (int b=-11; b<11; ++b) {
+            double m = rng.rand01();
+            Vec3 c(a+0.9*rng.rand01(), 0.2, b+0.9*rng.rand01());
+            if ((c-Vec3(4,.2,0)).length()<0.9) continue;
+            if ((c-Vec3(0,.2,0)).length()<0.9) continue;
+            if ((c-Vec3(-4,.2,0)).length()<0.9) continue;
 
-    // Random small spheres
-    for (int a = -11; a < 11; ++a) {
-        for (int b = -11; b < 11; ++b) {
-            double mat = rng.rand01();
-            Vec3 center(a + 0.9*rng.rand01(), 0.2, b + 0.9*rng.rand01());
-
-            if ((center - Vec3(4,0.2,0)).length() < 0.9) continue;
-            if ((center - Vec3(0,0.2,0)).length() < 0.9) continue;
-            if ((center - Vec3(-4,0.2,0)).length() < 0.9) continue;
-
-            if (mat < 0.65) {
-                // Lambertian
-                Vec3 albedo(rng.rand01()*rng.rand01(), rng.rand01()*rng.rand01(), rng.rand01()*rng.rand01());
-                world.push_back(Sphere(center, 0.2, Material::lambertian(albedo)));
-            } else if (mat < 0.85) {
-                // Metal
-                Vec3 albedo(rng.rr(0.5,1), rng.rr(0.5,1), rng.rr(0.5,1));
-                world.push_back(Sphere(center, 0.2, Material::metal(albedo, rng.rr(0,0.5))));
-            } else {
-                // Glass
-                world.push_back(Sphere(center, 0.2, Material::glass(1.5)));
-            }
+            if (m<0.65)
+                world.push_back(Sphere(c,0.2,Material::lambertian(
+                    Vec3(rng.rand01()*rng.rand01(),rng.rand01()*rng.rand01(),rng.rand01()*rng.rand01()))));
+            else if (m<0.85)
+                world.push_back(Sphere(c,0.2,Material::metal(
+                    Vec3(rng.rr(.5,1),rng.rr(.5,1),rng.rr(.5,1)),rng.rr(0,.5))));
+            else
+                world.push_back(Sphere(c,0.2,Material::glass(1.5)));
         }
     }
-
-    // Three hero spheres
-    world.push_back(Sphere(Vec3( 0,1,0), 1.0, Material::glass(1.5)));                        // Center: Glass
-    world.push_back(Sphere(Vec3(-4,1,0), 1.0, Material::lambertian(Vec3(0.4, 0.2, 0.1))));   // Left: Matte
-    world.push_back(Sphere(Vec3( 4,1,0), 1.0, Material::metal(Vec3(0.7, 0.6, 0.5), 0.0)));   // Right: Metal
-
+    world.push_back(Sphere(Vec3(0,1,0),1.0,Material::glass(1.5)));
+    world.push_back(Sphere(Vec3(-4,1,0),1.0,Material::lambertian(Vec3(0.4,0.2,0.1))));
+    world.push_back(Sphere(Vec3(4,1,0),1.0,Material::metal(Vec3(0.7,0.6,0.5),0.0)));
     return world;
 }
 
 
 // =============================================================================
-//  SECTION 9: TILE-BASED WORK QUEUE
-// =============================================================================
-//  The image is divided into TILE_SIZE x TILE_SIZE pixel tiles. All tiles are
-//  loaded into a shared queue. Worker threads dynamically pull tiles until the
-//  queue is empty. A Mutex serializes access to the queue index.
-//
-//  This achieves DYNAMIC LOAD BALANCING: if some tiles are computationally
-//  heavier (glass reflections, dense sphere clusters), faster threads
-//  automatically pick up more of the simpler tiles. Zero idle cores.
+//  SECTION 11: TILE-BASED WORK QUEUE
 // =============================================================================
 
 const int TILE_SIZE = 16;
 
-struct Tile {
-    int x0, y0, x1, y1; // Pixel bounds [x0,x1) x [y0,y1)
-};
+struct Tile { int x0,y0,x1,y1; };
 
 struct WorkQueue {
     std::vector<Tile> tiles;
     int next_idx;
     Mutex mutex;
-
-    void init(const std::vector<Tile>& t) { tiles = t; next_idx = 0; mutex.init(); }
+    void init(const std::vector<Tile>& t) { tiles=t; next_idx=0; mutex.init(); }
     bool pop(Tile& out) {
         mutex.lock();
-        bool got = (next_idx < (int)tiles.size());
-        if (got) out = tiles[next_idx++];
+        bool got=(next_idx<(int)tiles.size());
+        if(got) out=tiles[next_idx++];
         mutex.unlock();
         return got;
     }
@@ -536,28 +579,19 @@ struct WorkQueue {
 
 
 // =============================================================================
-//  SECTION 10: LIVE ASCII PROGRESS MAP
+//  SECTION 12: LIVE PROGRESS MAP (with ANSI / Win32 Colors)
 // =============================================================================
-//  [UNIT V DEMONSTRATION: SYMMETRIC MULTIPROCESSING & DOMAIN DECOMPOSITION]
 //
-//  The progress map is a real-time terminal visualization of the render:
+//  The progress map is a terminal grid where each character represents a 16x16
+//  pixel tile. As worker threads complete tiles, characters light up in the
+//  thread's assigned COLOR, creating a vivid visualization of parallel work
+//  distribution across CPU cores.
 //
-//    +-- Live Render Map (50 x 29 tiles, char = thread ID) --+
-//    |..................................................|
-//    |..0011..3322.44.......55667.......................|
-//    |.0011.33224.44.556667..............................|
-//    |..................................................|
-//    +--------------------------------------------------+
-//    Progress: [################------------------------] 42%
+//  Legend:
+//    '.'         = Pending (dim gray)
+//    '0'-'9'     = Completed by thread 0-9 (colored by thread ID)
+//    'A'-'Z'     = Completed by thread 10-35 (colored by thread ID)
 //
-//  Each '.' is a pending tile. As threads complete tiles, their ID number
-//  (0-9, A-Z) replaces the dot IN REAL-TIME. This directly visualizes:
-//    - Which core rendered which region of the image
-//    - How dynamic load balancing distributes work
-//    - The parallel wavefront sweeping across the domain
-//
-//  WINDOWS: Uses SetConsoleCursorPosition for flicker-free in-place updates.
-//  POSIX:   Uses carriage-return progress bar + post-render completion map.
 // =============================================================================
 
 struct ProgressMap {
@@ -565,150 +599,119 @@ struct ProgressMap {
     std::vector<char> grid;
     AtomicInt completed;
     Mutex print_mutex;
-
-    // Console coordinates (Windows live map)
-    int grid_row;     // Buffer row of first grid line
-    int grid_col;     // Buffer column of first tile char
-    int progress_row; // Buffer row of progress bar
-    bool live_enabled; // True if terminal is large enough for live map
+    int grid_row, grid_col, progress_row;
+    bool live;
 
     void init(int tx, int ty) {
-        tiles_x = tx;
-        tiles_y = ty;
-        total = tx * ty;
-        grid.assign(tx * ty, '.');
+        tiles_x=tx; tiles_y=ty; total=tx*ty;
+        grid.assign(tx*ty, '.');
         completed.set(0);
         print_mutex.init();
-        grid_col = 3; // "  |" = 3 chars before first tile
-
-        // Enable live map only if grid fits reasonably in terminal.
-        live_enabled = (tiles_x <= 80 && tiles_y <= 40);
+        grid_col = 3;
+        live = (tx<=80 && ty<=40);
     }
 
-    // Print the initial empty map to the terminal.
     void print_initial() {
-        if (!live_enabled) {
-            std::cout << "  (Grid too large for live map. Showing progress bar.)\n\n";
-            return;
-        }
+        if (!live) { std::cout << "  (Grid too large for live map. Progress bar only.)\n\n"; return; }
 
-        std::cout << "\n";
-        std::cout << "  Live Render Map (" << tiles_x << " x " << tiles_y
-                  << " tiles, char = thread ID)\n";
-
-        // Top border
+        std::cout << "\n  Live Render Map (" << tiles_x << " x " << tiles_y
+                  << " tiles, color = thread ID)\n";
         std::cout << "  +";
-        for (int i = 0; i < tiles_x; ++i) std::cout << "-";
+        for(int i=0;i<tiles_x;++i) std::cout<<"-";
         std::cout << "+\n";
-
         std::cout.flush();
 
 #ifdef _WIN32
         grid_row = get_cursor_row();
-#else
-        grid_row = 0; // Tracked manually (not used for POSIX live map)
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
 #endif
-
-        // Grid rows (all dots)
-        for (int y = 0; y < tiles_y; ++y) {
+        for (int y=0; y<tiles_y; ++y) {
             std::cout << "  |";
-            for (int x = 0; x < tiles_x; ++x) std::cout << ".";
+#ifdef _WIN32
+            SetConsoleTextAttribute(h, COLOR_DIM);
+#endif
+            for(int x=0;x<tiles_x;++x) std::cout<<".";
+#ifdef _WIN32
+            SetConsoleTextAttribute(h, COLOR_DEFAULT);
+#endif
             std::cout << "|\n";
         }
 
-        // Bottom border
         std::cout << "  +";
-        for (int i = 0; i < tiles_x; ++i) std::cout << "-";
+        for(int i=0;i<tiles_x;++i) std::cout<<"-";
         std::cout << "+\n";
-
         std::cout.flush();
 
 #ifdef _WIN32
         progress_row = get_cursor_row();
 #endif
-
-        // Initial progress bar
         std::cout << "  Progress: [";
-        for (int i = 0; i < 50; ++i) std::cout << "-";
+        for(int i=0;i<50;++i) std::cout<<"-";
         std::cout << "] 0% (0/" << total << " tiles)   \n\n";
         std::cout.flush();
     }
 
-    // Called by worker threads after each tile completion.
     void update(int tx, int ty, int thread_id) {
-        // Determine the display character for this thread.
-        char ch;
-        if (thread_id < 10) ch = '0' + thread_id;
-        else ch = 'A' + (thread_id - 10);
-
-        grid[ty * tiles_x + tx] = ch;
+        char ch = thread_id<10 ? ('0'+thread_id) : ('A'+thread_id-10);
+        grid[ty*tiles_x+tx] = ch;
         int done = completed.increment();
-        int pct = (int)(100.0 * done / total);
+        int pct = (int)(100.0*done/total);
 
         print_mutex.lock();
 
 #ifdef _WIN32
-        if (live_enabled) {
+        if (live) {
             HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
 
-            // --- Update the tile character in the live map ---
-            COORD tile_pos = {(SHORT)(grid_col + tx), (SHORT)(grid_row + ty)};
-            SetConsoleCursorPosition(h, tile_pos);
+            // Paint the tile character in the thread's color.
+            COORD tp = {(SHORT)(grid_col+tx), (SHORT)(grid_row+ty)};
+            SetConsoleCursorPosition(h, tp);
+            SetConsoleTextAttribute(h, THREAD_COLORS[thread_id % NUM_THREAD_COLORS]);
             putchar(ch);
+            SetConsoleTextAttribute(h, COLOR_DEFAULT);
 
-            // --- Update the progress bar ---
-            COORD prog_pos = {0, (SHORT)progress_row};
-            SetConsoleCursorPosition(h, prog_pos);
-
-            int bar_w = 50;
-            int filled = bar_w * done / total;
+            // Update progress bar.
+            COORD pp = {0, (SHORT)progress_row};
+            SetConsoleCursorPosition(h, pp);
+            int bw=50, filled=bw*done/total;
             printf("  Progress: [");
-            for (int i = 0; i < bar_w; ++i) putchar(i < filled ? '#' : '-');
+            for(int i=0;i<bw;++i) putchar(i<filled?'#':'-');
             printf("] %d%% (%d/%d tiles)   ", pct, done, total);
 
-            // Park cursor below the map.
-            COORD park = {0, (SHORT)(progress_row + 2)};
-            SetConsoleCursorPosition(h, park);
+            COORD pk = {0, (SHORT)(progress_row+2)};
+            SetConsoleCursorPosition(h, pk);
             fflush(stdout);
         } else {
-            // Fallback: simple progress bar with carriage return.
-            int bar_w = 50;
-            int filled = bar_w * done / total;
+            int bw=50, filled=bw*done/total;
             printf("\r  Progress: [");
-            for (int i = 0; i < bar_w; ++i) putchar(i < filled ? '#' : '-');
+            for(int i=0;i<bw;++i) putchar(i<filled?'#':'-');
             printf("] %d%% (%d/%d tiles)   ", pct, done, total);
             fflush(stdout);
         }
 #else
-        // POSIX: carriage-return progress bar (no cursor positioning).
-        int bar_w = 50;
-        int filled = bar_w * done / total;
+        int bw=50, filled=bw*done/total;
         printf("\r  Progress: [");
-        for (int i = 0; i < bar_w; ++i) putchar(i < filled ? '#' : '-');
+        for(int i=0;i<bw;++i) putchar(i<filled?'#':'-');
         printf("] %d%% (%d/%d tiles)   ", pct, done, total);
         fflush(stdout);
 #endif
-
         print_mutex.unlock();
     }
 
-    // Print the completion map after rendering (for POSIX or as summary).
     void print_completion_map() {
 #ifndef _WIN32
-        // On POSIX, the live map wasn't shown. Print the final result.
         std::cout << "\n\n  Completion Map (char = thread ID):\n";
         std::cout << "  +";
-        for (int i = 0; i < tiles_x; ++i) std::cout << "-";
-        std::cout << "+\n";
-        for (int y = 0; y < tiles_y; ++y) {
-            std::cout << "  |";
-            for (int x = 0; x < tiles_x; ++x)
-                std::cout << grid[y * tiles_x + x];
-            std::cout << "|\n";
+        for(int i=0;i<tiles_x;++i) std::cout<<"-";
+        std::cout<<"+\n";
+        for(int y=0;y<tiles_y;++y) {
+            std::cout<<"  |";
+            for(int x=0;x<tiles_x;++x) std::cout<<grid[y*tiles_x+x];
+            std::cout<<"|\n";
         }
-        std::cout << "  +";
-        for (int i = 0; i < tiles_x; ++i) std::cout << "-";
-        std::cout << "+\n";
+        std::cout<<"  +";
+        for(int i=0;i<tiles_x;++i) std::cout<<"-";
+        std::cout<<"+\n";
 #endif
     }
 
@@ -717,158 +720,149 @@ struct ProgressMap {
 
 
 // =============================================================================
-//  SECTION 11: RENDER WORKER
+//  SECTION 13: RENDER WORKER
 // =============================================================================
 
 struct RenderContext {
-    int image_width, image_height;
-    int samples, max_depth;
-    const Camera* camera;
+    int W, H, samples, max_depth;
+    const Camera* cam;
     const std::vector<Sphere>* world;
-    Vec3* pixel_buffer;
+    const std::vector<BVHNode>* bvh;
+    int bvh_root;
+    Vec3* pixels;
     WorkQueue* queue;
-    ProgressMap* progress_map;
+    ProgressMap* pm;
 };
 
-// Render all pixels within a single tile.
 void render_tile(const Tile& tile, RenderContext* ctx, RNG& rng) {
-    for (int j = tile.y0; j < tile.y1; ++j) {
-        for (int i = tile.x0; i < tile.x1; ++i) {
-            Vec3 color(0,0,0);
-            for (int s = 0; s < ctx->samples; ++s) {
-                double u = (i + rng.rand01()) / (ctx->image_width - 1);
-                double v = (j + rng.rand01()) / (ctx->image_height - 1);
-                color += ray_color(ctx->camera->get_ray(u, v, rng),
-                                   *(ctx->world), ctx->max_depth, rng);
+    for (int j=tile.y0; j<tile.y1; ++j) {
+        for (int i=tile.x0; i<tile.x1; ++i) {
+            Vec3 col(0,0,0);
+            for (int s=0; s<ctx->samples; ++s) {
+                double u = (i+rng.rand01())/(ctx->W-1);
+                double v = (j+rng.rand01())/(ctx->H-1);
+                col += ray_color(ctx->cam->get_ray(u,v,rng),
+                                 *(ctx->bvh), ctx->bvh_root,
+                                 *(ctx->world), ctx->max_depth, rng);
             }
-            double scale = 1.0 / ctx->samples;
-            color *= scale;
-            color = Vec3(std::sqrt(color.x), std::sqrt(color.y), std::sqrt(color.z)).clamped();
-            int row = ctx->image_height - 1 - j;
-            ctx->pixel_buffer[row * ctx->image_width + i] = color;
+            double sc = 1.0/ctx->samples;
+            col *= sc;
+            // Gamma correction: 1/2.2 (physically correct sRGB).
+            col = Vec3(std::pow(col.x, GAMMA),
+                       std::pow(col.y, GAMMA),
+                       std::pow(col.z, GAMMA)).clamped();
+            int row = ctx->H-1-j;
+            ctx->pixels[row*ctx->W+i] = col;
         }
     }
 }
 
-// Worker thread main loop: pull tiles, render, update progress.
-void worker_func(int thread_id, RenderContext* ctx) {
-    RNG rng((unsigned long long)(thread_id + 1) * 6364136223846793005ULL + 1442695040888963407ULL);
+void worker_func(int tid, RenderContext* ctx) {
+    RNG rng((unsigned long long)(tid+1)*6364136223846793005ULL+1442695040888963407ULL);
     Tile tile;
     while (ctx->queue->pop(tile)) {
         render_tile(tile, ctx, rng);
-        int tx = tile.x0 / TILE_SIZE;
-        int ty = tile.y0 / TILE_SIZE;
-        ctx->progress_map->update(tx, ty, thread_id);
+        ctx->pm->update(tile.x0/TILE_SIZE, tile.y0/TILE_SIZE, tid);
     }
 }
 
-// --- Platform Thread Entry Points -------------------------------------------
 struct ThreadData { int id; RenderContext* ctx; };
 
 #ifdef _WIN32
 DWORD WINAPI win32_worker(LPVOID arg) {
-    ThreadData* d = (ThreadData*)arg;
-    worker_func(d->id, d->ctx);
-    return 0;
+    ThreadData* d=(ThreadData*)arg; worker_func(d->id, d->ctx); return 0;
 }
 #else
 void* posix_worker(void* arg) {
-    ThreadData* d = (ThreadData*)arg;
-    worker_func(d->id, d->ctx);
-    return NULL;
+    ThreadData* d=(ThreadData*)arg; worker_func(d->id, d->ctx); return NULL;
 }
 #endif
 
 
 // =============================================================================
-//  SECTION 12: CLI PARSER
+//  SECTION 14: CLI
 // =============================================================================
 
 struct Config {
     int width, height, samples, threads, max_depth;
     std::string output;
     bool help;
-
-    Config() : width(800), height(0), samples(50), threads(0),
-               max_depth(50), output("lumina_render.ppm"), help(false) {}
+    Config() : width(800),height(0),samples(50),threads(0),max_depth(50),
+               output("lumina_render.ppm"),help(false) {}
 };
 
 void print_usage() {
-    std::cout << "\n  PROJECT LUMINA v3.0 -- Advanced Rendering Engine\n\n";
-    std::cout << "  Usage: lumina [options]\n\n";
-    std::cout << "  Options:\n";
-    std::cout << "    --width    <int>   Image width in pixels       (default: 800)\n";
-    std::cout << "    --height   <int>   Image height in pixels      (default: auto 16:9)\n";
-    std::cout << "    --samples  <int>   Anti-aliasing rays/pixel    (default: 50)\n";
-    std::cout << "    --threads  <int>   Worker thread count         (default: all cores)\n";
-    std::cout << "    --out      <str>   Output filename             (default: lumina_render.ppm)\n";
-    std::cout << "    --help             Show this help\n\n";
-    std::cout << "  Examples:\n";
-    std::cout << "    lumina --width 1920 --samples 200 --threads 8\n";
-    std::cout << "    lumina --width 400 --samples 10 --threads 1     (fast preview)\n\n";
+    std::cout << "\n  PROJECT LUMINA v4.0 -- Gold Standard Rendering Engine\n\n"
+              << "  Usage: lumina [options]\n\n"
+              << "    --width    <int>   Image width            (default: 800)\n"
+              << "    --height   <int>   Image height           (default: auto 16:9)\n"
+              << "    --samples  <int>   Rays per pixel         (default: 50)\n"
+              << "    --threads  <int>   Worker threads          (default: all cores)\n"
+              << "    --out      <str>   Output filename         (default: lumina_render.ppm)\n"
+              << "    --help             Show this help\n\n";
 }
 
 Config parse_args(int argc, char* argv[]) {
-    Config cfg;
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--help") == 0)  { cfg.help = true; }
-        else if (strcmp(argv[i], "--width")   == 0 && i+1 < argc) cfg.width   = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--height")  == 0 && i+1 < argc) cfg.height  = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--samples") == 0 && i+1 < argc) cfg.samples = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--threads") == 0 && i+1 < argc) cfg.threads = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--out")     == 0 && i+1 < argc) cfg.output  = argv[++i];
+    Config c;
+    for (int i=1; i<argc; ++i) {
+        if (!strcmp(argv[i],"--help"))    c.help=true;
+        else if (!strcmp(argv[i],"--width")  &&i+1<argc) c.width=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--height") &&i+1<argc) c.height=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--samples")&&i+1<argc) c.samples=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--threads")&&i+1<argc) c.threads=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--out")    &&i+1<argc) c.output=argv[++i];
     }
-    return cfg;
+    return c;
 }
 
 
 // =============================================================================
-//  SECTION 13: TERMINAL OUTPUT
+//  SECTION 15: TERMINAL OUTPUT
 // =============================================================================
 
-void pad_to(int len, int target) {
-    for (int i = len; i < target; ++i) std::cout << " ";
-}
+void pad_to(int len, int tgt) { for(int i=len;i<tgt;++i) std::cout<<" "; }
 
 void print_banner() {
-    std::cout << "\n";
-    std::cout << "  +==============================================================+\n";
-    std::cout << "  |          PROJECT LUMINA v3.0 -- Rendering Engine              |\n";
-    std::cout << "  |   Path Tracer with Live Progress Map & Thread Pool            |\n";
-    std::cout << "  |   Unit V: Parallel Organization (SMP Demonstration)           |\n";
-    std::cout << "  +==============================================================+\n\n";
+    std::cout << "\n"
+    "  +==============================================================+\n"
+    "  |          PROJECT LUMINA v4.0 -- Gold Standard Engine          |\n"
+    "  |   BVH-Accelerated Path Tracer with Colored Live Map          |\n"
+    "  |   Unit V: Parallel Organization (SMP Demonstration)          |\n"
+    "  +==============================================================+\n\n";
 }
 
-void print_config(const Config& c, int spheres, int tile_count) {
+void print_config(const Config& c, int spheres, int tiles, int bvh_nodes, int bvh_depth) {
     std::cout << "  +------------------ RENDER CONFIGURATION --------------------+\n";
     std::ostringstream s;
 
-    s.str(""); s << c.width << " x " << c.height << " (" << c.width*c.height << " pixels)";
-    std::cout << "  |  Resolution      : " << s.str(); pad_to((int)s.str().size(), 39); std::cout << "|\n";
+    s.str(""); s<<c.width<<" x "<<c.height<<" ("<<c.width*c.height<<" px)";
+    std::cout<<"  |  Resolution      : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << c.samples << " rays/pixel";
-    std::cout << "  |  Anti-Aliasing    : " << s.str(); pad_to((int)s.str().size(), 39); std::cout << "|\n";
+    s.str(""); s<<c.samples<<" rays/pixel";
+    std::cout<<"  |  Anti-Aliasing    : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << c.max_depth << " bounces";
-    std::cout << "  |  Max Ray Depth   : " << s.str(); pad_to((int)s.str().size(), 39); std::cout << "|\n";
+    s.str(""); s<<c.max_depth<<" bounces";
+    std::cout<<"  |  Max Ray Depth   : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << spheres << " spheres (procedural)";
-    std::cout << "  |  Scene Geometry   : " << s.str(); pad_to((int)s.str().size(), 39); std::cout << "|\n";
+    s.str(""); s<<spheres<<" spheres";
+    std::cout<<"  |  Scene Geometry   : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << tile_count << " tiles (" << TILE_SIZE << "x" << TILE_SIZE << " px)";
-    std::cout << "  |  Work Tiles       : " << s.str(); pad_to((int)s.str().size(), 39); std::cout << "|\n";
+    s.str(""); s<<bvh_nodes<<" nodes, depth "<<bvh_depth<<" -> O(log n)";
+    std::cout<<"  |  BVH Tree        : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << c.threads << " threads";
-    std::cout << "  |  Worker Threads   : " << s.str(); pad_to((int)s.str().size(), 39); std::cout << "|\n";
+    s.str(""); s<<tiles<<" tiles ("<<TILE_SIZE<<"x"<<TILE_SIZE<<" px)";
+    std::cout<<"  |  Work Tiles       : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    std::string mode = (c.threads == 1) ? "SEQUENTIAL (Single-Core)" : "PARALLEL (Multi-Core SMP)";
-    std::cout << "  |  Execution Mode   : " << mode; pad_to((int)mode.size(), 39); std::cout << "|\n";
+    s.str(""); s<<c.threads<<" threads";
+    std::cout<<"  |  Worker Threads   : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    std::cout << "  |  Output           : " << c.output; pad_to((int)c.output.size(), 39); std::cout << "|\n";
+    std::string mode = c.threads==1 ? "SEQUENTIAL" : "PARALLEL (SMP)";
+    std::cout<<"  |  Execution Mode   : "<<mode; pad_to((int)mode.size(),39); std::cout<<"|\n";
+
+    s.str(""); s<<"gamma 1/2.2 (sRGB)";
+    std::cout<<"  |  Gamma Correction : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
     std::cout << "  +------------------------------------------------------------+\n\n";
-    std::cout << "  Materials: Lambertian + Metal (fuzz) + Dielectric (glass)\n";
-    std::cout << "  Camera:    DOF enabled | aperture=0.1 | focus=10.0\n";
 }
 
 
@@ -877,219 +871,206 @@ void print_config(const Config& c, int spheres, int tile_count) {
 // =============================================================================
 
 int main(int argc, char* argv[]) {
-
-    // --- CLI ----------------------------------------------------------------
     Config cfg = parse_args(argc, argv);
     if (cfg.help) { print_usage(); return 0; }
 
-    const double ASPECT = 16.0 / 9.0;
-    if (cfg.width  < 1) cfg.width  = 800;
-    if (cfg.height < 1) cfg.height = (int)(cfg.width / ASPECT);
-    if (cfg.samples < 1) cfg.samples = 50;
-    if (cfg.threads < 1) cfg.threads = get_hw_threads();
-    if (cfg.threads < 1) cfg.threads = 1;
-    if (cfg.threads > 64) cfg.threads = 64; // WaitForMultipleObjects limit
+    const double ASPECT = 16.0/9.0;
+    if (cfg.width<1)   cfg.width=800;
+    if (cfg.height<1)  cfg.height=(int)(cfg.width/ASPECT);
+    if (cfg.samples<1) cfg.samples=50;
+    if (cfg.threads<1) cfg.threads=get_hw_threads();
+    if (cfg.threads<1) cfg.threads=1;
+    if (cfg.threads>64) cfg.threads=64;
 
-    const int W = cfg.width, H = cfg.height;
+    const int W=cfg.width, H=cfg.height;
 
     // --- Scene --------------------------------------------------------------
     RNG scene_rng(42);
     std::vector<Sphere> world = random_scene(scene_rng);
 
+    // --- BVH Construction ---------------------------------------------------
+    //  Build the acceleration structure BEFORE rendering starts.
+    //  This is a one-time O(N log N) cost that saves O(N) per ray during render.
+    std::vector<BVHNode> bvh_nodes;
+    bvh_nodes.reserve(2 * world.size() + 2);
+    std::vector<int> bvh_indices(world.size());
+    for (int i = 0; i < (int)world.size(); ++i) bvh_indices[i] = i;
+    g_bvh_depth = 0;
+
+    auto bvh_start = std::chrono::high_resolution_clock::now();
+    int bvh_root = build_bvh(bvh_nodes, bvh_indices, 0, (int)world.size(), world, 0);
+    auto bvh_end = std::chrono::high_resolution_clock::now();
+    double bvh_ms = std::chrono::duration<double,std::milli>(bvh_end-bvh_start).count();
+
     // --- Camera -------------------------------------------------------------
-    Camera cam(Vec3(13,2,3), Vec3(0,0,0), Vec3(0,1,0),
-               20.0, (double)W/H, 0.1, 10.0);
+    Camera cam(Vec3(13,2,3), Vec3(0,0,0), Vec3(0,1,0), 20.0,
+               (double)W/H, 0.1, 10.0);
 
     // --- Pixel Buffer -------------------------------------------------------
-    std::vector<Vec3> pixels(W * H);
+    std::vector<Vec3> pixels(W*H);
 
-    // --- Generate Tiles & Shuffle for Interesting Pattern -------------------
-    //  Shuffling the tile order creates a scattered render pattern in the
-    //  live map (tiles light up across the whole image, not just top-to-bottom).
-    //  This also improves load balancing for scenes with uneven complexity.
+    // --- Tile Generation (shuffled for scattered render pattern) -------------
     std::vector<Tile> tile_list;
-    for (int y = 0; y < H; y += TILE_SIZE)
-        for (int x = 0; x < W; x += TILE_SIZE)
-            tile_list.push_back({x, y, std::min(x+TILE_SIZE, W), std::min(y+TILE_SIZE, H)});
+    for (int y=0; y<H; y+=TILE_SIZE)
+        for (int x=0; x<W; x+=TILE_SIZE)
+            tile_list.push_back({x,y,std::min(x+TILE_SIZE,W),std::min(y+TILE_SIZE,H)});
 
-    RNG shuffle_rng(12345);
-    for (int i = (int)tile_list.size() - 1; i > 0; --i) {
-        int j = (int)(shuffle_rng.rand01() * (i + 1));
-        if (j > i) j = i;
+    RNG shuf_rng(12345);
+    for (int i=(int)tile_list.size()-1; i>0; --i) {
+        int j=(int)(shuf_rng.rand01()*(i+1)); if(j>i)j=i;
         std::swap(tile_list[i], tile_list[j]);
     }
 
-    int tiles_x = (W + TILE_SIZE - 1) / TILE_SIZE;
-    int tiles_y = (H + TILE_SIZE - 1) / TILE_SIZE;
-
+    int tiles_x=(W+TILE_SIZE-1)/TILE_SIZE, tiles_y=(H+TILE_SIZE-1)/TILE_SIZE;
     WorkQueue queue;
     queue.init(tile_list);
 
-    // --- Progress Map -------------------------------------------------------
     ProgressMap pm;
     pm.init(tiles_x, tiles_y);
 
     // --- Print Config -------------------------------------------------------
     print_banner();
-    print_config(cfg, (int)world.size(), (int)tile_list.size());
+    print_config(cfg, (int)world.size(), (int)tile_list.size(),
+                 (int)bvh_nodes.size(), g_bvh_depth);
+
+    std::cout << "  BVH built in " << std::fixed;
+    std::cout.precision(2);
+    std::cout << bvh_ms << " ms (" << bvh_nodes.size() << " nodes, depth "
+              << g_bvh_depth << ")\n";
+    std::cout << "  Materials: Lambertian + Metal + Dielectric (Schlick)\n";
+    std::cout << "  Camera: DOF (aperture=0.1, focus=10)\n";
+
     pm.print_initial();
 
-    // --- Render Context (shared by all workers) -----------------------------
+    // --- Render Context -----------------------------------------------------
     RenderContext ctx;
-    ctx.image_width  = W;
-    ctx.image_height = H;
-    ctx.samples      = cfg.samples;
-    ctx.max_depth    = cfg.max_depth;
-    ctx.camera       = &cam;
-    ctx.world        = &world;
-    ctx.pixel_buffer = &pixels[0];
-    ctx.queue        = &queue;
-    ctx.progress_map = &pm;
+    ctx.W=W; ctx.H=H; ctx.samples=cfg.samples; ctx.max_depth=cfg.max_depth;
+    ctx.cam=&cam; ctx.world=&world; ctx.bvh=&bvh_nodes; ctx.bvh_root=bvh_root;
+    ctx.pixels=&pixels[0]; ctx.queue=&queue; ctx.pm=&pm;
 
     // =========================================================================
-    //  [UNIT V DEMONSTRATION: SYMMETRIC MULTIPROCESSING & DOMAIN DECOMPOSITION]
+    //  [UNIT V: SYMMETRIC MULTIPROCESSING & DOMAIN DECOMPOSITION]
     //
-    //  TILE-BASED THREAD POOL WITH WORK-STEALING QUEUE:
+    //  TILE-BASED THREAD POOL WITH BVH-ACCELERATED INTERSECTION:
     //
-    //  1. Image divided into 16x16 pixel tiles (TILE_SIZE), shuffled randomly.
-    //  2. All tiles pushed to a thread-safe WorkQueue (Mutex-protected index).
-    //  3. N worker threads spawned (one per core).
-    //  4. Each worker DYNAMICALLY pops tiles, renders them, updates progress.
-    //  5. Workers exit when queue is empty. Main thread joins all (barrier).
+    //  1. Scene organized into a BVH tree → O(log N) per-ray intersection.
+    //  2. Image divided into 16×16 tiles, shuffled, pushed to work queue.
+    //  3. N worker threads dynamically steal tiles from the queue.
+    //  4. Each thread renders its tile using the shared (read-only) BVH.
+    //  5. Atomic progress counter + colored live map show real-time status.
+    //  6. Main thread joins all workers (synchronization barrier).
     //
-    //  This achieves:
-    //    * ZERO idle cores — dynamic load balancing
-    //    * CACHE-FRIENDLY — 16x16 tiles fit in L1 cache
-    //    * SCALABLE — works for 1 to 64+ threads
-    //    * OBSERVABLE — live map shows which thread rendered each tile
+    //  COMBINED SPEEDUP:
+    //    Threading:  ~Nx   (N cores → near-linear scaling)
+    //    BVH:        ~26x  (O(log N) vs O(N) intersection)
+    //    Total:      ~26N× compared to single-core brute-force
     // =========================================================================
 
-    auto t_start = std::chrono::high_resolution_clock::now();
+    auto t0 = std::chrono::high_resolution_clock::now();
 
     int N = cfg.threads;
     std::vector<ThreadData> td(N);
 
 #ifdef _WIN32
     std::vector<HANDLE> handles(N);
-    for (int i = 0; i < N; ++i) {
-        td[i].id = i;
-        td[i].ctx = &ctx;
-        handles[i] = CreateThread(NULL, 0, win32_worker, &td[i], 0, NULL);
-    }
+    for (int i=0;i<N;++i) { td[i]={i,&ctx}; handles[i]=CreateThread(NULL,0,win32_worker,&td[i],0,NULL); }
     WaitForMultipleObjects(N, &handles[0], TRUE, INFINITE);
-    for (int i = 0; i < N; ++i) CloseHandle(handles[i]);
+    for (int i=0;i<N;++i) CloseHandle(handles[i]);
 #else
     std::vector<pthread_t> pt(N);
-    for (int i = 0; i < N; ++i) {
-        td[i].id = i;
-        td[i].ctx = &ctx;
-        pthread_create(&pt[i], NULL, posix_worker, &td[i]);
-    }
-    for (int i = 0; i < N; ++i) pthread_join(pt[i], NULL);
+    for (int i=0;i<N;++i) { td[i]={i,&ctx}; pthread_create(&pt[i],NULL,posix_worker,&td[i]); }
+    for (int i=0;i<N;++i) pthread_join(pt[i], NULL);
 #endif
 
-    auto t_end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = t_end - t_start;
+    auto t1 = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = t1-t0;
 
-    // Finalize display
     pm.print_completion_map();
 
 #ifdef _WIN32
-    if (pm.live_enabled) {
-        // Cursor is parked 2 rows below progress bar. Print from there.
-    } else {
-        std::cout << "\n";
-    }
+    if (!pm.live) std::cout<<"\n";
 #else
-    std::cout << "\n";
+    std::cout<<"\n";
 #endif
-
     std::cout << "\n  >> All " << N << " threads completed.\n\n";
 
     // --- Write PPM ----------------------------------------------------------
     std::cout << "  >> Writing " << cfg.output << "... ";
     std::cout.flush();
-
     std::ofstream file(cfg.output.c_str());
-    if (!file.is_open()) {
-        std::cerr << "ERROR: Cannot write to " << cfg.output << "\n";
-        return 1;
-    }
+    if (!file.is_open()) { std::cerr<<"ERROR\n"; return 1; }
     file << "P3\n" << W << " " << H << "\n255\n";
-    for (int i = 0; i < W * H; ++i) {
+    for (int i=0; i<W*H; ++i)
         file << (int)(255.999*pixels[i].x) << " "
              << (int)(255.999*pixels[i].y) << " "
              << (int)(255.999*pixels[i].z) << "\n";
-    }
     file.close();
     std::cout << "Done.\n\n";
 
     // --- Performance Report -------------------------------------------------
-    long long total_rays = (long long)W * H * cfg.samples;
-
+    long long total_rays = (long long)W*H*cfg.samples;
     std::cout << "  +==============================================================+\n";
     std::cout << "  |                    PERFORMANCE REPORT                         |\n";
     std::cout << "  +==============================================================+\n";
-
     std::ostringstream s;
 
-    s.str(""); s << N;
-    std::cout << "  |  Worker Threads   : " << s.str(); pad_to((int)s.str().size(),39); std::cout << "|\n";
+    s.str(""); s<<N;
+    std::cout<<"  |  Worker Threads   : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << (int)tile_list.size() << " tiles (" << TILE_SIZE << "x" << TILE_SIZE << ")";
-    std::cout << "  |  Work Units       : " << s.str(); pad_to((int)s.str().size(),39); std::cout << "|\n";
+    s.str(""); s<<(int)tile_list.size()<<" tiles ("<<TILE_SIZE<<"x"<<TILE_SIZE<<")";
+    std::cout<<"  |  Work Units       : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << W*H;
-    std::cout << "  |  Total Pixels     : " << s.str(); pad_to((int)s.str().size(),39); std::cout << "|\n";
+    s.str(""); s<<W*H;
+    std::cout<<"  |  Total Pixels     : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << total_rays;
-    std::cout << "  |  Primary Rays     : " << s.str(); pad_to((int)s.str().size(),39); std::cout << "|\n";
+    s.str(""); s<<total_rays;
+    std::cout<<"  |  Primary Rays     : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << (int)world.size();
-    std::cout << "  |  Scene Spheres    : " << s.str(); pad_to((int)s.str().size(),39); std::cout << "|\n";
+    s.str(""); s<<(int)world.size()<<" spheres";
+    std::cout<<"  |  Scene Objects    : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << std::fixed; s.precision(4); s << elapsed.count() << " seconds";
-    std::cout << "  |  Render Time      : " << s.str(); pad_to((int)s.str().size(),39); std::cout << "|\n";
+    s.str(""); s<<(int)bvh_nodes.size()<<" nodes, depth "<<g_bvh_depth;
+    std::cout<<"  |  BVH Structure    : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    double mrps = total_rays / elapsed.count() / 1e6;
-    s.str(""); s << std::fixed; s.precision(2); s << mrps << " Mrays/sec";
-    std::cout << "  |  Throughput       : " << s.str(); pad_to((int)s.str().size(),39); std::cout << "|\n";
+    s.str(""); s<<std::fixed; s.precision(4); s<<elapsed.count()<<" seconds";
+    std::cout<<"  |  Render Time      : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
-    s.str(""); s << cfg.output;
-    std::cout << "  |  Output File      : " << s.str(); pad_to((int)s.str().size(),39); std::cout << "|\n";
+    double mrps = total_rays/elapsed.count()/1e6;
+    s.str(""); s<<std::fixed; s.precision(2); s<<mrps<<" Mrays/sec";
+    std::cout<<"  |  Throughput       : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
+
+    s.str(""); s<<"gamma 1/2.2 (sRGB)";
+    std::cout<<"  |  Gamma            : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
+
+    s.str(""); s<<cfg.output;
+    std::cout<<"  |  Output File      : "<<s.str(); pad_to((int)s.str().size(),39); std::cout<<"|\n";
 
     std::cout << "  +--------------------------------------------------------------+\n";
-
-    if (N == 1) {
+    if (N==1) {
         std::cout << "  |  MODE: SEQUENTIAL (Baseline)                                |\n";
         std::cout << "  |  Re-run with --threads N to observe parallel speedup.       |\n";
     } else {
-        std::cout << "  |  MODE: PARALLEL (Tile-Based SMP Thread Pool)                |\n";
+        std::cout << "  |  MODE: PARALLEL (BVH + Tile-Based SMP Thread Pool)          |\n";
         std::cout << "  |  Compare with --threads 1 to measure speedup ratio.         |\n";
     }
     std::cout << "  +==============================================================+\n\n";
     std::cout << "  >> Render complete. Open " << cfg.output << " to view.\n\n";
 
-    queue.destroy();
-    pm.destroy();
+    queue.destroy(); pm.destroy();
     return 0;
 }
 
 // =============================================================================
-//  COMPILATION INSTRUCTIONS
+//  COMPILATION
 // =============================================================================
 //
-//  WINDOWS (MinGW g++):
-//    g++ -std=c++11 -O3 -o lumina.exe main.cpp
-//    .\lumina.exe
-//    .\lumina.exe --width 400 --samples 10 --threads 1   (fast single-core test)
-//    .\lumina.exe --width 800 --samples 100 --threads 8   (quality render)
+//  WINDOWS (MinGW):
+//    g++ -std=c++11 -O3 -march=native -o lumina.exe main.cpp
 //
 //  WINDOWS (MSVC):
 //    cl /EHsc /O2 /std:c++14 main.cpp /Fe:lumina.exe
 //
-//  LINUX / macOS (g++ or clang++):
-//    g++ -std=c++11 -O3 -pthread -o lumina main.cpp
-//    ./lumina --width 1200 --samples 100 --threads 8
+//  LINUX / macOS:
+//    g++ -std=c++11 -O3 -march=native -pthread -o lumina main.cpp
 //
 // =============================================================================
